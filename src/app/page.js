@@ -2,7 +2,8 @@
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { Link2, FolderOpen, Clock, ArrowRight, AlertTriangle, Trash2, Sparkles, CheckSquare } from "lucide-react";
+import { createClient } from "@/lib/supabase/client";
+import { Link2, FolderOpen, Clock, ArrowRight, AlertTriangle, Trash2, Sparkles, CheckSquare, LogOut, User } from "lucide-react";
 
 const DEMO_STRUCTURE = {
   name: "Project Apollo - Web App Dev",
@@ -59,34 +60,108 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [history, setHistory] = useState([]);
+  const [user, setUser] = useState(null);
+  
   const router = useRouter();
+  const supabase = createClient();
 
-  // Load history from localStorage
+  // Load User and history
   useEffect(() => {
-    const savedHistory = localStorage.getItem("megaHistory");
-    if (savedHistory) {
-      try {
-        setHistory(JSON.parse(savedHistory));
-      } catch (e) {
-        console.error("Failed to parse history", e);
+    const fetchUserAndHistory = async () => {
+      const { data: { user: currentUser } } = await supabase.auth.getUser();
+      setUser(currentUser);
+
+      if (currentUser) {
+        await loadHistory(currentUser);
+      }
+    };
+    fetchUserAndHistory();
+  }, [supabase]);
+
+  const loadHistory = async (currentUser) => {
+    try {
+      const { data, error: dbError } = await supabase
+        .from("parsed_links")
+        .select("*")
+        .eq("user_id", currentUser.id)
+        .order("last_accessed", { ascending: false })
+        .limit(5);
+
+      if (dbError) throw dbError;
+
+      if (data) {
+        setHistory(data.map(item => ({
+          url: item.url,
+          name: item.name,
+          timestamp: new Date(item.last_accessed).toLocaleString()
+        })));
+      }
+    } catch (err) {
+      console.warn("DB history load failed (Table may not exist yet). Falling back to localStorage:", err.message);
+      const savedHistory = localStorage.getItem("megaHistory");
+      if (savedHistory) {
+        try {
+          setHistory(JSON.parse(savedHistory));
+        } catch (e) {
+          console.error("Failed to parse history", e);
+        }
       }
     }
-  }, []);
-
-  const saveToHistory = (url, name) => {
-    const newHistory = [
-      { url, name, timestamp: new Date().toLocaleString() },
-      ...history.filter(item => item.url !== url)
-    ].slice(0, 5); // Limit to last 5 entries
-    
-    setHistory(newHistory);
-    localStorage.setItem("megaHistory", JSON.stringify(newHistory));
   };
 
-  const clearHistory = (e) => {
+  const saveToHistory = async (url, name) => {
+    const timestamp = new Date().toISOString();
+    
+    if (user) {
+      try {
+        const { error: dbError } = await supabase
+          .from("parsed_links")
+          .upsert({
+            user_id: user.id,
+            url,
+            name,
+            last_accessed: timestamp
+          }, { onConflict: "user_id,url" });
+
+        if (dbError) throw dbError;
+        await loadHistory(user);
+      } catch (err) {
+        console.warn("DB history save failed (Table may not exist yet). Falling back to localStorage:", err.message);
+        
+        // Local fallback
+        const newHistory = [
+          { url, name, timestamp: new Date().toLocaleString() },
+          ...history.filter(item => item.url !== url)
+        ].slice(0, 5);
+        setHistory(newHistory);
+        localStorage.setItem("megaHistory", JSON.stringify(newHistory));
+      }
+    }
+  };
+
+  const clearHistory = async (e) => {
     e.stopPropagation();
-    setHistory([]);
-    localStorage.removeItem("megaHistory");
+    
+    if (user) {
+      try {
+        const { error: dbError } = await supabase
+          .from("parsed_links")
+          .delete()
+          .eq("user_id", user.id);
+
+        if (dbError) throw dbError;
+        setHistory([]);
+      } catch (err) {
+        console.warn("DB history delete failed. Falling back to localStorage:", err.message);
+        setHistory([]);
+        localStorage.removeItem("megaHistory");
+      }
+    }
+  };
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    router.refresh();
   };
 
   const handleFetch = async (urlToFetch) => {
@@ -111,8 +186,8 @@ export default function Home() {
       localStorage.setItem("currentMegaStructure", JSON.stringify(data));
       localStorage.setItem("currentMegaUrl", urlToFetch);
 
-      // Save to recent links history
-      saveToHistory(urlToFetch, data.name);
+      // Save to history (DB or fallback)
+      await saveToHistory(urlToFetch, data.name);
 
       // Navigate to dashboard
       router.push("/dashboard");
@@ -141,6 +216,18 @@ export default function Home() {
           <CheckSquare className="brand-icon" size={24} />
           <span>MEGA Task Sync</span>
         </div>
+        {user && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+              <User size={14} />
+              <span>{user.email}</span>
+            </div>
+            <button className="back-button" onClick={handleSignOut} style={{ fontSize: '0.85rem' }}>
+              <LogOut size={14} />
+              <span>Sign Out</span>
+            </button>
+          </div>
+        )}
       </nav>
 
       <section className="hero-section">

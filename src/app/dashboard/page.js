@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { createClient } from "@/lib/supabase/client";
 import { 
   ArrowLeft, 
   Folder, 
@@ -15,11 +16,14 @@ import {
   Clock,
   Check,
   CheckCircle2,
-  Calendar
+  Calendar,
+  LogOut,
+  User
 } from "lucide-react";
 
 export default function Dashboard() {
   const router = useRouter();
+  const supabase = createClient();
   
   // App state
   const [structure, setStructure] = useState(null);
@@ -28,66 +32,127 @@ export default function Dashboard() {
   const [expandedFolders, setExpandedFolders] = useState({});
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [searchQuery, setSearchQuery] = useState("");
+  const [currentUser, setCurrentUser] = useState(null);
   
   // To-Do list state
   const [tasks, setTasks] = useState([]);
   const [newTaskTitle, setNewTaskTitle] = useState("");
 
-  // Load structure and URL from localStorage on mount
+  // Load structure, user, and tasks on mount
   useEffect(() => {
-    const savedStructure = localStorage.getItem("currentMegaStructure");
-    const savedUrl = localStorage.getItem("currentMegaUrl");
+    const initDashboard = async () => {
+      // 1. Get logged in user details
+      const { data: { user } } = await supabase.auth.getUser();
+      setCurrentUser(user);
 
-    if (!savedStructure || !savedUrl) {
-      router.push("/");
-      return;
-    }
+      // 2. Read local session states
+      const savedStructure = localStorage.getItem("currentMegaStructure");
+      const savedUrl = localStorage.getItem("currentMegaUrl");
 
-    try {
-      const parsedStructure = JSON.parse(savedStructure);
-      setStructure(parsedStructure);
-      setMegaUrl(savedUrl);
+      if (!savedStructure || !savedUrl) {
+        router.push("/");
+        return;
+      }
 
-      // Build flat map
-      const map = {};
-      const buildMap = (node, path = "") => {
-        const currentPath = path ? `${path}/${node.name}` : node.name;
-        const flatNode = {
-          ...node,
-          path: currentPath,
-          descendants: []
+      try {
+        const parsedStructure = JSON.parse(savedStructure);
+        setStructure(parsedStructure);
+        setMegaUrl(savedUrl);
+
+        // Build flat map
+        const map = {};
+        const buildMap = (node, path = "") => {
+          const currentPath = path ? `${path}/${node.name}` : node.name;
+          const flatNode = {
+            ...node,
+            path: currentPath,
+            descendants: []
+          };
+          map[node.id] = flatNode;
+
+          if (node.directory && node.children) {
+            node.children.forEach(child => {
+              buildMap(child, currentPath);
+              flatNode.descendants.push(child.id, ...map[child.id].descendants);
+            });
+          }
         };
-        map[node.id] = flatNode;
-
-        if (node.directory && node.children) {
-          node.children.forEach(child => {
-            buildMap(child, currentPath);
-            flatNode.descendants.push(child.id, ...map[child.id].descendants);
-          });
-        }
-      };
-      
-      buildMap(parsedStructure);
-      setFlatMap(map);
-
-      // Auto-expand the root folder
-      setExpandedFolders({ [parsedStructure.id]: true });
-
-      // Load tasks from localStorage or initialize
-      const savedTasks = localStorage.getItem(`tasks_${savedUrl}`);
-      if (savedTasks) {
-        const parsedTasks = JSON.parse(savedTasks);
-        setTasks(parsedTasks);
         
-        // Sync selected checkboxes in the tree with existing file tasks
+        buildMap(parsedStructure);
+        setFlatMap(map);
+        setExpandedFolders({ [parsedStructure.id]: true });
+
+        // 3. Load tasks from Supabase (or fallback to localStorage)
+        let loadedTasks = null;
+        let loadedFromDb = false;
+
+        if (user) {
+          try {
+            const { data: dbData, error: dbError } = await supabase
+              .from("tasks")
+              .select("*")
+              .eq("user_id", user.id)
+              .eq("mega_url", savedUrl);
+
+            if (dbError) throw dbError;
+
+            if (dbData && dbData.length > 0) {
+              loadedTasks = dbData.map(t => ({
+                id: t.id,
+                megaId: t.mega_id || null,
+                title: t.title,
+                path: t.path,
+                completed: t.completed,
+                priority: t.priority || "Medium",
+                status: t.status || "To Do",
+                notes: t.notes || ""
+              }));
+              loadedFromDb = true;
+            }
+          } catch (dbErr) {
+            console.warn("Supabase tasks load failed (Tables might not be configured yet). Using localStorage fallback:", dbErr.message);
+          }
+        }
+
+        // Fallback if not loaded from DB
+        if (!loadedFromDb) {
+          const savedTasks = localStorage.getItem(`tasks_${savedUrl}`);
+          if (savedTasks) {
+            loadedTasks = JSON.parse(savedTasks);
+          } else {
+            // First load default tasks
+            const initialTasks = [];
+            Object.keys(map).forEach(id => {
+              const node = map[id];
+              if (!node.directory) {
+                initialTasks.push({
+                  id: `task-${id}`,
+                  megaId: id,
+                  title: node.name,
+                  path: node.path.substring(0, node.path.lastIndexOf("/")),
+                  completed: false,
+                  priority: "Medium",
+                  status: "To Do",
+                  notes: ""
+                });
+              }
+            });
+            loadedTasks = initialTasks;
+            localStorage.setItem(`tasks_${savedUrl}`, JSON.stringify(initialTasks));
+          }
+        }
+
+        setTasks(loadedTasks);
+
+        // Sync selected checkboxes in tree with loaded tasks
         const initiallySelected = new Set();
-        parsedTasks.forEach(task => {
+        loadedTasks.forEach(task => {
           if (task.megaId) {
             initiallySelected.add(task.megaId);
           }
         });
-        
-        // Also ensure folders whose descendants are all checked are highlighted
+
+        // Highlight folder structures whose children are all checked
         Object.keys(map).forEach(id => {
           const node = map[id];
           if (node.directory && node.descendants.length > 0) {
@@ -99,44 +164,57 @@ export default function Dashboard() {
             }
           }
         });
-        
+
         setSelectedIds(initiallySelected);
-      } else {
-        // First load: auto-select all files and make them tasks
-        const initialSelected = new Set();
-        const initialTasks = [];
 
-        Object.keys(map).forEach(id => {
-          const node = map[id];
-          initialSelected.add(id);
-          
-          // Only files (or empty folders) become discrete tasks
-          if (!node.directory) {
-            initialTasks.push({
-              id: `task-${id}`,
-              megaId: id,
-              title: node.name,
-              path: node.path.substring(0, node.path.lastIndexOf("/")),
-              completed: false,
-              priority: "Medium",
-              status: "To Do",
-              notes: ""
-            });
-          }
-        });
-
-        setSelectedIds(initialSelected);
-        setTasks(initialTasks);
-        localStorage.setItem(`tasks_${savedUrl}`, JSON.stringify(initialTasks));
+      } catch (e) {
+        console.error("Error setting up dashboard data:", e);
+        router.push("/");
       }
+    };
 
-    } catch (e) {
-      console.error("Error setting up dashboard data:", e);
-      router.push("/");
+    initDashboard();
+  }, [router, supabase]);
+
+  // Sync state modifications helper
+  const syncTaskToDb = async (task) => {
+    if (!currentUser || !megaUrl) return;
+    try {
+      const { error } = await supabase
+        .from("tasks")
+        .upsert({
+          id: task.id,
+          user_id: currentUser.id,
+          mega_id: task.megaId || null,
+          mega_url: megaUrl,
+          title: task.title,
+          path: task.path,
+          completed: task.completed,
+          priority: task.priority,
+          status: task.status,
+          notes: task.notes || "",
+          updated_at: new Date().toISOString()
+        });
+      if (error) throw error;
+    } catch (err) {
+      console.warn("DB task sync failed:", err.message);
     }
-  }, [router]);
+  };
 
-  // Persist tasks and synchronize checkbox states
+  const deleteTaskFromDb = async (taskId) => {
+    if (!currentUser) return;
+    try {
+      const { error } = await supabase
+        .from("tasks")
+        .delete()
+        .eq("id", taskId)
+        .eq("user_id", currentUser.id);
+      if (error) throw error;
+    } catch (err) {
+      console.warn("DB task delete failed:", err.message);
+    }
+  };
+
   const saveTasks = (updatedTasks) => {
     setTasks(updatedTasks);
     if (megaUrl) {
@@ -153,13 +231,13 @@ export default function Dashboard() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
   };
 
-  // Folder toggle expanded status
+  // Folder toggling
   const toggleFolder = (id, e) => {
     e.stopPropagation();
     setExpandedFolders(prev => ({ ...prev, [id]: !prev[id] }));
   };
 
-  // Checkbox state calculation helper
+  // Checkbox evaluation
   const getCheckboxState = (id) => {
     if (selectedIds.has(id)) return "checked";
     
@@ -175,34 +253,40 @@ export default function Dashboard() {
     return "unchecked";
   };
 
-  // Handle click on node checkbox in the tree
-  const handleCheckboxClick = (id, e) => {
+  // Handle tree clicks
+  const handleCheckboxClick = async (id, e) => {
     e.stopPropagation();
     const node = flatMap[id];
     if (!node) return;
 
     const newSelected = new Set(selectedIds);
     const isCurrentlyChecked = getCheckboxState(id) === "checked";
-
-    // IDs to select/deselect
     const targetIds = [id, ...node.descendants];
 
+    let tasksToSync = [];
+    let taskIdsToDelete = [];
+
     if (isCurrentlyChecked) {
-      // Uncheck this node and all descendants
+      // Uncheck
       targetIds.forEach(tId => newSelected.delete(tId));
       
-      // Uncheck parent folders recursively
       let parent = Object.values(flatMap).find(n => n.directory && n.children && n.children.some(c => c.id === id));
       while (parent) {
         newSelected.delete(parent.id);
         const currentParentId = parent.id;
         parent = Object.values(flatMap).find(n => n.directory && n.children && n.children.some(c => c.id === currentParentId));
       }
+
+      // Collect IDs to delete
+      tasks.forEach(task => {
+        if (task.megaId && targetIds.includes(task.megaId)) {
+          taskIdsToDelete.push(task.id);
+        }
+      });
     } else {
-      // Check this node and all descendants
+      // Check
       targetIds.forEach(tId => newSelected.add(tId));
 
-      // Update parent folders checked status
       Object.keys(flatMap).forEach(fId => {
         const fNode = flatMap[fId];
         if (fNode.directory && fNode.descendants.length > 0) {
@@ -212,77 +296,80 @@ export default function Dashboard() {
           }
         }
       });
+
+      // Prepare files to insert
+      Object.keys(flatMap).forEach(fId => {
+        const fNode = flatMap[fId];
+        if (!fNode.directory && newSelected.has(fId)) {
+          const exists = tasks.some(t => t.megaId === fId);
+          if (!exists) {
+            tasksToSync.push({
+              id: `task-${fId}`,
+              megaId: fId,
+              title: fNode.name,
+              path: fNode.path.substring(0, fNode.path.lastIndexOf("/")),
+              completed: false,
+              priority: "Medium",
+              status: "To Do",
+              notes: ""
+            });
+          }
+        }
+      });
     }
 
     setSelectedIds(newSelected);
 
-    // Sync file nodes to tasks
-    let updatedTasks = [...tasks];
-    
-    // 1. Remove tasks for deselected files
-    updatedTasks = updatedTasks.filter(task => {
-      if (task.megaId) {
-        return newSelected.has(task.megaId);
-      }
-      return true; // Keep manual tasks
-    });
-
-    // 2. Add tasks for newly selected files
-    Object.keys(flatMap).forEach(fId => {
-      const fNode = flatMap[fId];
-      if (!fNode.directory && newSelected.has(fId)) {
-        const taskExists = updatedTasks.some(t => t.megaId === fId);
-        if (!taskExists) {
-          updatedTasks.push({
-            id: `task-${fId}`,
-            megaId: fId,
-            title: fNode.name,
-            path: fNode.path.substring(0, fNode.path.lastIndexOf("/")),
-            completed: false,
-            priority: "Medium",
-            status: "To Do",
-            notes: ""
-          });
-        }
-      }
-    });
-
+    // Apply state changes locally
+    let updatedTasks = tasks.filter(t => !taskIdsToDelete.includes(t.id));
+    updatedTasks = [...updatedTasks, ...tasksToSync];
     saveTasks(updatedTasks);
+
+    // Sync changes to DB
+    if (currentUser) {
+      for (const idToDelete of taskIdsToDelete) {
+        await deleteTaskFromDb(idToDelete);
+      }
+      for (const taskToSync of tasksToSync) {
+        await syncTaskToDb(taskToSync);
+      }
+    }
   };
 
-  // Toggle single task completed status in list
-  const handleTaskToggle = (taskId) => {
-    const updatedTasks = tasks.map(task => {
-      if (task.id === taskId) {
-        const nextCompleted = !task.completed;
-        return { 
-          ...task, 
-          completed: nextCompleted, 
-          status: nextCompleted ? "Completed" : "To Do" 
-        };
-      }
-      return task;
-    });
+  // Toggle single task status
+  const handleTaskToggle = async (taskId) => {
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) return;
+
+    const nextCompleted = !task.completed;
+    const updatedTask = { 
+      ...task, 
+      completed: nextCompleted, 
+      status: nextCompleted ? "Completed" : "To Do" 
+    };
+
+    const updatedTasks = tasks.map(t => t.id === taskId ? updatedTask : t);
     saveTasks(updatedTasks);
+    await syncTaskToDb(updatedTask);
   };
 
-  // Update specific task values
-  const handleTaskChange = (taskId, field, value) => {
-    const updatedTasks = tasks.map(task => {
-      if (task.id === taskId) {
-        const updated = { ...task, [field]: value };
-        if (field === "status") {
-          updated.completed = value === "Completed";
-        }
-        return updated;
-      }
-      return task;
-    });
+  // Change single task priority/notes
+  const handleTaskChange = async (taskId, field, value) => {
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) return;
+
+    const updatedTask = { ...task, [field]: value };
+    if (field === "status") {
+      updatedTask.completed = value === "Completed";
+    }
+
+    const updatedTasks = tasks.map(t => t.id === taskId ? updatedTask : t);
     saveTasks(updatedTasks);
+    await syncTaskToDb(updatedTask);
   };
 
   // Add manual task
-  const handleAddManualTask = (e) => {
+  const handleAddManualTask = async (e) => {
     e.preventDefault();
     if (!newTaskTitle.trim()) return;
 
@@ -296,22 +383,24 @@ export default function Dashboard() {
       notes: ""
     };
 
-    saveTasks([...tasks, newTask]);
+    const updatedTasks = [...tasks, newTask];
+    saveTasks(updatedTasks);
     setNewTaskTitle("");
+    await syncTaskToDb(newTask);
   };
 
-  // Delete individual task
-  const handleDeleteTask = (taskId) => {
+  // Delete task
+  const handleDeleteTask = async (taskId) => {
     const taskToDelete = tasks.find(t => t.id === taskId);
     const updatedTasks = tasks.filter(t => t.id !== taskId);
     saveTasks(updatedTasks);
+    await deleteTaskFromDb(taskId);
 
-    // If it was a MEGA node, also deselect it in the tree
+    // Sync check status in tree if it was a MEGA node
     if (taskToDelete && taskToDelete.megaId) {
       const newSelected = new Set(selectedIds);
       newSelected.delete(taskToDelete.megaId);
       
-      // Also deselect parent directories in the tree
       let parent = Object.values(flatMap).find(n => n.directory && n.children && n.children.some(c => c.id === taskToDelete.megaId));
       while (parent) {
         newSelected.delete(parent.id);
@@ -323,9 +412,10 @@ export default function Dashboard() {
     }
   };
 
-  // Select All Files
-  const selectAll = () => {
+  // Select All
+  const selectAll = async () => {
     const newSelected = new Set();
+    const tasksToSync = [];
     const updatedTasks = [...tasks];
 
     Object.keys(flatMap).forEach(id => {
@@ -334,7 +424,7 @@ export default function Dashboard() {
       if (!node.directory) {
         const exists = updatedTasks.some(t => t.megaId === id);
         if (!exists) {
-          updatedTasks.push({
+          const newTask = {
             id: `task-${id}`,
             megaId: id,
             title: node.name,
@@ -343,45 +433,58 @@ export default function Dashboard() {
             priority: "Medium",
             status: "To Do",
             notes: ""
-          });
+          };
+          updatedTasks.push(newTask);
+          tasksToSync.push(newTask);
         }
       }
     });
 
     setSelectedIds(newSelected);
     saveTasks(updatedTasks);
+
+    if (currentUser) {
+      for (const t of tasksToSync) {
+        await syncTaskToDb(t);
+      }
+    }
   };
 
-  // Deselect All Files
-  const deselectAll = () => {
+  // Deselect All
+  const deselectAll = async () => {
     setSelectedIds(new Set());
-    // Remove all MEGA tasks, keep manual ones
+    
+    const megaTaskIds = tasks.filter(t => t.megaId).map(t => t.id);
     const updatedTasks = tasks.filter(t => !t.megaId);
     saveTasks(updatedTasks);
+
+    if (currentUser) {
+      for (const id of megaTaskIds) {
+        await deleteTaskFromDb(id);
+      }
+    }
   };
 
-  // Render tree node recursively
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    router.push("/login");
+  };
+
+  // Render nodes recursively
   const renderTreeNode = (node) => {
     if (!node) return null;
     
-    // Filter logic
     const matchesSearch = node.name.toLowerCase().includes(searchQuery.toLowerCase());
-    
-    // Check if any descendant matches the search query
     const hasMatchingDescendant = node.directory && node.children && node.children.some(child => {
       const checkDescendantMatch = (n) => {
         if (n.name.toLowerCase().includes(searchQuery.toLowerCase())) return true;
-        if (n.directory && n.children) {
-          return n.children.some(checkDescendantMatch);
-        }
+        if (n.directory && n.children) return n.children.some(checkDescendantMatch);
         return false;
       };
       return checkDescendantMatch(child);
     });
 
-    if (searchQuery && !matchesSearch && !hasMatchingDescendant) {
-      return null;
-    }
+    if (searchQuery && !matchesSearch && !hasMatchingDescendant) return null;
 
     const isExpanded = expandedFolders[node.id];
     const checkboxState = getCheckboxState(node.id);
@@ -425,11 +528,7 @@ export default function Dashboard() {
     );
   };
 
-  // Calculation for progress bar
-  const completedTasksCount = tasks.filter(t => t.completed).length;
-  const progressPercent = tasks.length > 0 ? ((completedTasksCount / tasks.length) * 100).toFixed(1) : "0.0";
-
-  // Group tasks by folder path
+  // Group tasks by folder
   const getGroupedTasks = () => {
     const groups = {};
     tasks.forEach(task => {
@@ -444,10 +543,13 @@ export default function Dashboard() {
 
   const groupedTasks = getGroupedTasks();
   const sortedGroupKeys = Object.keys(groupedTasks).sort((a, b) => {
-    if (a === "Manual Task") return 1; // Put manual tasks at the end
+    if (a === "Manual Task") return 1;
     if (b === "Manual Task") return -1;
     return a.localeCompare(b);
   });
+
+  const completedTasksCount = tasks.filter(t => t.completed).length;
+  const progressPercent = tasks.length > 0 ? ((completedTasksCount / tasks.length) * 100).toFixed(1) : "0.0";
 
   return (
     <>
@@ -456,10 +558,27 @@ export default function Dashboard() {
           <CheckSquare className="brand-icon" size={24} />
           <span>MEGA Task Sync</span>
         </div>
-        <button className="back-button" onClick={() => router.push("/")}>
-          <ArrowLeft size={16} />
-          <span>Parse Another Link</span>
-        </button>
+        
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
+          {currentUser && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+              <User size={14} />
+              <span>{currentUser.email}</span>
+            </div>
+          )}
+          
+          <button className="back-button" onClick={() => router.push("/")} style={{ fontSize: '0.9rem' }}>
+            <ArrowLeft size={16} />
+            <span>Link Hub</span>
+          </button>
+          
+          {currentUser && (
+            <button className="back-button" onClick={handleSignOut} style={{ fontSize: '0.9rem' }}>
+              <LogOut size={16} />
+              <span>Log Out</span>
+            </button>
+          )}
+        </div>
       </nav>
 
       <div className="workspace-container">
@@ -469,7 +588,7 @@ export default function Dashboard() {
             <div className="explorer-title-wrapper">
               <span className="explorer-title">
                 <Folder size={18} style={{ color: 'var(--color-primary)' }} />
-                <span>File Structure Explorer</span>
+                <span>File Explorer</span>
               </span>
             </div>
 
@@ -506,7 +625,7 @@ export default function Dashboard() {
             <div className="todo-stats">
               <h2 className="todo-title">Task List</h2>
               <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
-                Syncing {tasks.filter(t => t.megaId).length} file nodes from {structure?.name || "MEGA URL"}
+                Syncing {tasks.filter(t => t.megaId).length} files from {structure?.name || "MEGA URL"}
               </span>
             </div>
 
