@@ -1,65 +1,27 @@
-import { createServerClient } from '@supabase/ssr'
-import { NextResponse } from 'next/server'
+import { clerkMiddleware, createRouteMatcher } from '@clerk/nextjs/server';
 
-export async function proxy(request) {
-  let response = NextResponse.next({
-    request: {
-      headers: request.headers,
-    },
-  })
+const isProtectedRoute = createRouteMatcher([
+  '/dashboard(.*)',
+  '/'
+]);
 
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
-    {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value, options }) => request.cookies.set(name, value))
-          response = NextResponse.next({
-            request,
-          })
-          cookiesToSet.forEach(({ name, value, options }) =>
-            response.cookies.set(name, value, options)
-          )
-        },
-      },
-    }
-  )
-
-  const { data: { user } } = await supabase.auth.getUser()
-
-  const isLoginPage = request.nextUrl.pathname.startsWith('/login')
-  const isAuthCallback = request.nextUrl.pathname.startsWith('/auth')
-  const isApiRoute = request.nextUrl.pathname.startsWith('/api')
-
-  // If there's no user and trying to access a protected page, redirect to login
-  if (!user && !isLoginPage && !isAuthCallback && !isApiRoute) {
-    const url = request.nextUrl.clone()
-    url.pathname = '/login'
-    return NextResponse.redirect(url)
+const clerk = clerkMiddleware(async (auth, req) => {
+  if (isProtectedRoute(req)) {
+    await auth.protect();
   }
+});
 
-  // If user is already logged in and tries to access login page, redirect to landing
-  if (user && isLoginPage) {
-    const url = request.nextUrl.clone()
-    url.pathname = '/'
-    return NextResponse.redirect(url)
-  }
-
-  return response
+export async function proxy(request, event) {
+  return clerk(request, event);
 }
 
 export const config = {
   matcher: [
-    /*
-     * Match all request paths except for the ones starting with:
-     * - _next/static (static files)
-     * - _next/image (image optimization files)
-     * - favicon.ico (favicon file)
-     */
-    '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
+    // Skip Next.js internals and all static files, unless found in search params
+    '/((?!_next|[^?]*\\.(?:html?|css|js(?!on)|jpe?g|webp|png|gif|svg|ttf|woff2?|ico|csv|docx?|xlsx?|zip|webmanifest)).*)',
+    // Always run for API routes
+    '/(api|trpc)(.*)',
+    // Always run for Clerk-specific frontend API routes
+    '/__clerk/(.*)',
   ],
-}
+};

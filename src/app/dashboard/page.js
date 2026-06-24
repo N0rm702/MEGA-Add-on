@@ -2,7 +2,8 @@
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { createClient } from "@/lib/supabase/client";
+import { UserButton, useUser } from "@clerk/nextjs";
+import { getTasksAction, syncTaskAction, deleteTaskAction } from "@/app/actions/todo";
 import { 
   ArrowLeft, 
   Folder, 
@@ -12,18 +13,15 @@ import {
   Plus, 
   Search, 
   Trash2, 
-  AlertCircle,
   Clock,
   Check,
   CheckCircle2,
-  Calendar,
-  LogOut,
   User
 } from "lucide-react";
 
 export default function Dashboard() {
   const router = useRouter();
-  const supabase = createClient();
+  const { isLoaded, isSignedIn, user } = useUser();
   
   // App state
   const [structure, setStructure] = useState(null);
@@ -32,7 +30,6 @@ export default function Dashboard() {
   const [expandedFolders, setExpandedFolders] = useState({});
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [searchQuery, setSearchQuery] = useState("");
-  const [currentUser, setCurrentUser] = useState(null);
   
   // To-Do list state
   const [tasks, setTasks] = useState([]);
@@ -40,12 +37,9 @@ export default function Dashboard() {
 
   // Load structure, user, and tasks on mount
   useEffect(() => {
-    const initDashboard = async () => {
-      // 1. Get logged in user details
-      const { data: { user } } = await supabase.auth.getUser();
-      setCurrentUser(user);
+    if (!isLoaded || !isSignedIn) return;
 
-      // 2. Read local session states
+    const initDashboard = async () => {
       const savedStructure = localStorage.getItem("currentMegaStructure");
       const savedUrl = localStorage.getItem("currentMegaUrl");
 
@@ -82,36 +76,16 @@ export default function Dashboard() {
         setFlatMap(map);
         setExpandedFolders({ [parsedStructure.id]: true });
 
-        // 3. Load tasks from Supabase (or fallback to localStorage)
+        // Load tasks from Server Action (or fallback to localStorage)
         let loadedTasks = null;
         let loadedFromDb = false;
 
-        if (user) {
-          try {
-            const { data: dbData, error: dbError } = await supabase
-              .from("tasks")
-              .select("*")
-              .eq("user_id", user.id)
-              .eq("mega_url", savedUrl);
-
-            if (dbError) throw dbError;
-
-            if (dbData && dbData.length > 0) {
-              loadedTasks = dbData.map(t => ({
-                id: t.id,
-                megaId: t.mega_id || null,
-                title: t.title,
-                path: t.path,
-                completed: t.completed,
-                priority: t.priority || "Medium",
-                status: t.status || "To Do",
-                notes: t.notes || ""
-              }));
-              loadedFromDb = true;
-            }
-          } catch (dbErr) {
-            console.warn("Supabase tasks load failed (Tables might not be configured yet). Using localStorage fallback:", dbErr.message);
-          }
+        const res = await getTasksAction(savedUrl);
+        if (res.success && res.tasks && res.tasks.length > 0) {
+          loadedTasks = res.tasks;
+          loadedFromDb = true;
+        } else if (!res.success) {
+          console.warn("Server Action tasks load failed (Tables may not exist yet). Using local fallback:", res.error);
         }
 
         // Fallback if not loaded from DB
@@ -174,44 +148,22 @@ export default function Dashboard() {
     };
 
     initDashboard();
-  }, [router, supabase]);
+  }, [router, isLoaded, isSignedIn]);
 
-  // Sync state modifications helper
-  const syncTaskToDb = async (task) => {
-    if (!currentUser || !megaUrl) return;
-    try {
-      const { error } = await supabase
-        .from("tasks")
-        .upsert({
-          id: task.id,
-          user_id: currentUser.id,
-          mega_id: task.megaId || null,
-          mega_url: megaUrl,
-          title: task.title,
-          path: task.path,
-          completed: task.completed,
-          priority: task.priority,
-          status: task.status,
-          notes: task.notes || "",
-          updated_at: new Date().toISOString()
-        });
-      if (error) throw error;
-    } catch (err) {
-      console.warn("DB task sync failed:", err.message);
+  // Sync state modifications Server Action helpers
+  const syncTask = async (task) => {
+    if (!isSignedIn) return;
+    const res = await syncTaskAction(task, megaUrl);
+    if (!res.success) {
+      console.warn("DB task sync failed:", res.error);
     }
   };
 
-  const deleteTaskFromDb = async (taskId) => {
-    if (!currentUser) return;
-    try {
-      const { error } = await supabase
-        .from("tasks")
-        .delete()
-        .eq("id", taskId)
-        .eq("user_id", currentUser.id);
-      if (error) throw error;
-    } catch (err) {
-      console.warn("DB task delete failed:", err.message);
+  const deleteTask = async (taskId) => {
+    if (!isSignedIn) return;
+    const res = await deleteTaskAction(taskId);
+    if (!res.success) {
+      console.warn("DB task delete failed:", res.error);
     }
   };
 
@@ -326,12 +278,12 @@ export default function Dashboard() {
     saveTasks(updatedTasks);
 
     // Sync changes to DB
-    if (currentUser) {
+    if (isSignedIn) {
       for (const idToDelete of taskIdsToDelete) {
-        await deleteTaskFromDb(idToDelete);
+        await deleteTask(idToDelete);
       }
       for (const taskToSync of tasksToSync) {
-        await syncTaskToDb(taskToSync);
+        await syncTask(taskToSync);
       }
     }
   };
@@ -350,7 +302,7 @@ export default function Dashboard() {
 
     const updatedTasks = tasks.map(t => t.id === taskId ? updatedTask : t);
     saveTasks(updatedTasks);
-    await syncTaskToDb(updatedTask);
+    await syncTask(updatedTask);
   };
 
   // Change single task priority/notes
@@ -365,7 +317,7 @@ export default function Dashboard() {
 
     const updatedTasks = tasks.map(t => t.id === taskId ? updatedTask : t);
     saveTasks(updatedTasks);
-    await syncTaskToDb(updatedTask);
+    await syncTask(updatedTask);
   };
 
   // Add manual task
@@ -386,7 +338,7 @@ export default function Dashboard() {
     const updatedTasks = [...tasks, newTask];
     saveTasks(updatedTasks);
     setNewTaskTitle("");
-    await syncTaskToDb(newTask);
+    await syncTask(newTask);
   };
 
   // Delete task
@@ -394,7 +346,7 @@ export default function Dashboard() {
     const taskToDelete = tasks.find(t => t.id === taskId);
     const updatedTasks = tasks.filter(t => t.id !== taskId);
     saveTasks(updatedTasks);
-    await deleteTaskFromDb(taskId);
+    await deleteTask(taskId);
 
     // Sync check status in tree if it was a MEGA node
     if (taskToDelete && taskToDelete.megaId) {
@@ -443,9 +395,9 @@ export default function Dashboard() {
     setSelectedIds(newSelected);
     saveTasks(updatedTasks);
 
-    if (currentUser) {
+    if (isSignedIn) {
       for (const t of tasksToSync) {
-        await syncTaskToDb(t);
+        await syncTask(t);
       }
     }
   };
@@ -458,16 +410,11 @@ export default function Dashboard() {
     const updatedTasks = tasks.filter(t => !t.megaId);
     saveTasks(updatedTasks);
 
-    if (currentUser) {
+    if (isSignedIn) {
       for (const id of megaTaskIds) {
-        await deleteTaskFromDb(id);
+        await deleteTask(id);
       }
     }
-  };
-
-  const handleSignOut = async () => {
-    await supabase.auth.signOut();
-    router.push("/login");
   };
 
   // Render nodes recursively
@@ -560,24 +507,20 @@ export default function Dashboard() {
         </div>
         
         <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
-          {currentUser && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-              <User size={14} />
-              <span>{currentUser.email}</span>
-            </div>
+          {isLoaded && isSignedIn && (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                <User size={14} />
+                <span>{user.primaryEmailAddress?.emailAddress}</span>
+              </div>
+              <UserButton afterSignOutUrl="/sign-in" />
+            </>
           )}
           
           <button className="back-button" onClick={() => router.push("/")} style={{ fontSize: '0.9rem' }}>
             <ArrowLeft size={16} />
             <span>Link Hub</span>
           </button>
-          
-          {currentUser && (
-            <button className="back-button" onClick={handleSignOut} style={{ fontSize: '0.9rem' }}>
-              <LogOut size={16} />
-              <span>Log Out</span>
-            </button>
-          )}
         </div>
       </nav>
 
